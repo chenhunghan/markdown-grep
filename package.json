@@ -1,0 +1,30 @@
+{
+  "name": "mdg",
+  "version": "0.1.0",
+  "module": "src/cli/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "mdg": "src/cli/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/cli/index.ts",
+    "build": "bun build src/cli/index.ts --compile --outfile mdg --external node-llama-cpp --external sqlite-vec --external @node-llama-cpp/mac-x64 --external @node-llama-cpp/linux-x64-cuda --external @node-llama-cpp/linux-x64-cuda-ext --external @node-llama-cpp/linux-x64-vulkan --external @node-llama-cpp/linux-x64 --external @node-llama-cpp/linux-arm64 --external @node-llama-cpp/linux-armv7l --external @node-llama-cpp/win-x64-cuda --external @node-llama-cpp/win-x64-cuda-ext --external @node-llama-cpp/win-x64-vulkan --external @node-llama-cpp/win-x64 --external @node-llama-cpp/win-arm64",
+    "postbuild": "bun run scripts/setup-libs.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "just-bash": "^2.14.0",
+    "node-llama-cpp": "^3.18.1",
+    "sqlite-vec": "^0.1.9"
+  },
+  "trustedDependencies": [
+    "node-llama-cpp"
+  ]
+}
