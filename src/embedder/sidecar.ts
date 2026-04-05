@@ -102,7 +102,7 @@ function findPackageManager(): { cmd: string; name: string } {
   throw new Error(
     "Neither bun nor npm found in PATH. " +
       "Please install bun (https://bun.sh) or Node.js, " +
-      "then run `mdg grep --semantic` again."
+      "then run `mdg grep` again."
   );
 }
 
@@ -281,7 +281,7 @@ export async function installSidecar(
   const platformPkg = getPlatformPackage();
   const pm = findPackageManager();
 
-  log(`Installing node-llama-cpp for semantic search (one-time setup)...`);
+  log(`Installing node-llama-cpp for hybrid search (one-time setup)...`);
   log(`  Platform package: ${platformPkg}`);
   log(`  Installing to: ${MDG_DIR}`);
   log(`  Using: ${pm.name}`);

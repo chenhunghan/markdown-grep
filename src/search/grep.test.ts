@@ -44,7 +44,7 @@ test("-e patterns are not duplicated into the shell command", async () => {
   expect(result.stdout).toBe("# mdg — Markdown Grep\n");
 });
 
-test("semantic formatter uses grep-like filenames without slashes", () => {
+test("hybrid formatter uses grep-like filenames without slashes", () => {
   const result = formatSearchResults(
     [
       {

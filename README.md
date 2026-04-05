@@ -57,22 +57,15 @@ mdg grep -rc "pattern" docs/
 mdg grep -rn -A 2 -B 1 "function" .
 ```
 
-### Semantic search (vector similarity)
+### Hybrid search (vector similarity)
 
 ```bash
 # Search by meaning, not exact text
-mdg grep --semantic "how to configure the API"
-mdg grep -s "error handling patterns" docs/
+mdg grep "how to configure the API"
+mdg grep "error handling patterns" docs/
 
 # Combine with grep flags for output formatting
-mdg grep --semantic -nl "authentication flow"
-```
-
-### Hybrid search (RRF fusion)
-
-```bash
-# Combines FTS5 + vector search using Reciprocal Rank Fusion
-mdg grep --hybrid "search query" [path...]
+mdg grep -nl "authentication flow"
 ```
 
 ### Indexing
@@ -100,26 +93,26 @@ bun run build
 # The binary can be moved anywhere; it looks for vec0.dylib in ~/.mdg/lib/
 ```
 
-## Semantic search setup
+## Search setup
 
 The compiled binary handles grep and FTS search standalone (60MB binary).
-Semantic/hybrid search requires node-llama-cpp, which is auto-installed on
+Hybrid search requires node-llama-cpp, which is auto-installed on
 first use:
 
 ```bash
-# Pre-install semantic search dependencies (~52MB)
+# Pre-install hybrid search dependencies (~52MB)
 mdg setup
 
-# Or just use --semantic and it auto-installs on first run
-mdg grep --semantic "how to configure the API"
+# Or just use mdg grep and it auto-installs on first run
+mdg grep "how to configure the API"
 ```
 
 The sidecar installs node-llama-cpp to `~/.mdg/node_modules/` and creates
 an IPC-based embed server (`~/.mdg/embed-server.js`). The compiled binary
-spawns this server as a subprocess when semantic search is needed.
+spawns this server as a subprocess when hybrid search is needed.
 
 The embedding model (~328MB) is downloaded on first `mdg index` or
-`mdg grep --semantic` to `~/.mdg/models/`.
+`mdg grep` to `~/.mdg/models/`.
 
 ## How it works
 
@@ -127,7 +120,7 @@ The embedding model (~328MB) is downloaded on first `mdg index` or
   files to search (coarse filter), then just-bash's grep produces exact output.
 - **Lazy indexing**: First `mdg grep` triggers a background FTS-only index if
   no index exists. Embeddings are generated separately via `mdg index`.
-- **Semantic search**: Embeds the query with a local GGUF model, then finds
+- **Hybrid search**: Embeds the query with a local GGUF model, then finds
   nearest chunks via sqlite-vec KNN search.
 - **Hybrid search**: Runs FTS and vector search in parallel, merges results
   using Reciprocal Rank Fusion (RRF) for better ranking.
@@ -172,7 +165,7 @@ src/
 
 ## Requirements
 
-- [Bun](https://bun.sh) v1.3+ (required for build and semantic search sidecar)
+- [Bun](https://bun.sh) v1.3+ (required for build and hybrid search sidecar)
 - macOS: Homebrew SQLite (`brew install sqlite`) for extension loading
-- For semantic/hybrid search: ~52MB for node-llama-cpp sidecar + ~328MB for
+- For hybrid search: ~52MB for node-llama-cpp sidecar + ~328MB for
   the default embedding model (both auto-downloaded on first use)

@@ -4,8 +4,7 @@
  * A CLI tool for searching markdown files powered by FTS + vector search.
  *
  * Usage:
- *   mdg grep [grep-flags] <pattern> [path...]   # grep with FTS acceleration
- *   mdg grep --semantic <query> [path...]        # semantic/vector search
+ *   mdg grep [grep-flags] <pattern> [path...]   # hybrid search (default)
  *   mdg index [--force]                          # build/update index
  *   mdg status                                   # show index status
  */
@@ -52,17 +51,13 @@ function printHelp() {
   console.log(`mdg — Markdown Grep
 
 Usage:
-  mdg grep [grep-flags] <pattern> [path...]   Search markdown files
-  mdg grep --semantic <query> [path...]        Semantic/vector search
-  mdg grep --hybrid <query> [path...]          Hybrid FTS + vector search (RRF)
+  mdg grep [grep-flags] <pattern> [path...]   Search markdown files (hybrid by default)
   mdg index [options]                          Build/update search index
   mdg status                                   Show index status
-  mdg setup                                    Install semantic search deps
+  mdg setup                                    Install hybrid search deps
 
 Grep flags:
   All standard grep flags are supported (-i, -n, -r, -l, -c, -v, -w, -x, etc.)
-  --semantic, -s   Use vector/semantic search instead of text grep
-  --hybrid         Use hybrid search (RRF fusion of FTS + vector)
 
 Index options:
   -f, --force         Force re-index all files
@@ -76,14 +71,14 @@ Environment:
 // ─── mdg setup ──────────────────────────────────────────────────────
 async function runSetup() {
   if (isSidecarInstalled()) {
-    console.log("Semantic search dependencies are already installed.");
+    console.log("Hybrid search dependencies are already installed.");
     console.log("  Location: ~/.mdg/node_modules/node-llama-cpp");
     return;
   }
 
   try {
     await installSidecar((msg) => console.log(msg));
-    console.log("\nSetup complete. You can now use --semantic and --hybrid flags.");
+    console.log("\nSetup complete. Hybrid search is now available.");
   } catch (e: any) {
     console.error(`Setup failed: ${e.message}`);
     process.exit(1);
@@ -154,20 +149,9 @@ async function runStatus() {
 async function runGrep(rawArgs: string[]) {
   const cwd = process.cwd();
 
-  // Extract --semantic / -s and --hybrid flags (our custom flags)
-  let semantic = false;
-  let hybrid = false;
-  const grepArgs = rawArgs.filter((arg) => {
-    if (arg === "--semantic" || arg === "-s") {
-      semantic = true;
-      return false;
-    }
-    if (arg === "--hybrid") {
-      hybrid = true;
-      return false;
-    }
-    return true;
-  });
+  // Hybrid search is the default; keep legacy flags as no-ops.
+  const hybrid = true;
+  const grepArgs = rawArgs;
 
   // Parse grep args
   const { flags, pattern, paths } = parseGrepArgs(grepArgs);
@@ -186,7 +170,6 @@ async function runGrep(rawArgs: string[]) {
       pattern,
       paths,
       flags,
-      semantic,
       hybrid,
       cwd,
       patternFromFlag,

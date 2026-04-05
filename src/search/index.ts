@@ -19,6 +19,14 @@ export interface SearchResult {
 }
 
 /**
+ * Ensure the embedding runtime is initialized before any SQLite access.
+ * This avoids Bun's SQLite loader colliding with the vector embedder setup.
+ */
+export async function ensureVectorSearchReady(): Promise<number> {
+  return getEmbeddingDimensions();
+}
+
+/**
  * Full-text search using FTS5.
  * Translates grep-like patterns to FTS5 query syntax.
  */
@@ -94,12 +102,13 @@ export async function searchVector(
     filePaths?: string[];
   } = {}
 ): Promise<SearchResult[]> {
-  const db = getDb();
   const limit = options.limit || 20;
 
-  // Ensure vec table exists
-  const dimensions = await getEmbeddingDimensions();
+  // Ensure the embedder initializes before SQLite is touched.
+  const dimensions = await ensureVectorSearchReady();
   ensureVecTable(dimensions);
+
+  const db = getDb();
 
   // Embed the query
   const queryVector = await embed(query, "query");
@@ -237,8 +246,19 @@ export async function searchHybrid(
     ftsWeight?: number;
     /** Weight for vector results (default 1.0) */
     vecWeight?: number;
+    /** Dependency overrides for tests */
+    deps?: {
+      searchFTS?: typeof searchFTS;
+      searchVector?: typeof searchVector;
+      ensureVectorSearchReady?: typeof ensureVectorSearchReady;
+    };
   } = {}
 ): Promise<SearchResult[]> {
+  const searchFtsFn = options.deps?.searchFTS ?? searchFTS;
+  const searchVectorFn = options.deps?.searchVector ?? searchVector;
+  const ensureVectorSearchReadyFn =
+    options.deps?.ensureVectorSearchReady ?? ensureVectorSearchReady;
+
   const limit = options.limit || 20;
   const k = options.rrfK || 60;
   const ftsWeight = options.ftsWeight ?? 1.0;
@@ -247,11 +267,17 @@ export async function searchHybrid(
   // Fetch more candidates than needed for fusion
   const fetchLimit = limit * 3;
 
-  // Run FTS and vector search in parallel
-  const [ftsResults, vecResults] = await Promise.all([
-    Promise.resolve(searchFTS(query, { limit: fetchLimit, filePaths: options.filePaths })),
-    searchVector(query, { limit: fetchLimit, filePaths: options.filePaths }),
-  ]);
+  // Initialize vector search before any SQLite access in the parallel branches.
+  await ensureVectorSearchReadyFn();
+
+  // Run FTS first, then vector search to avoid sqlite connection contention.
+  const ftsResults = await Promise.resolve(
+    searchFtsFn(query, { limit: fetchLimit, filePaths: options.filePaths })
+  );
+  const vecResults = await searchVectorFn(query, {
+    limit: fetchLimit,
+    filePaths: options.filePaths,
+  });
 
   // Build RRF scores keyed by chunk identity (filePath:startLine)
   const rrfScores = new Map<string, { score: number; result: SearchResult }>();

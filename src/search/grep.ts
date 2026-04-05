@@ -5,7 +5,7 @@
  *   1. If index exists, use FTS to find candidate files (coarse filter)
  *   2. Narrow the grep args to only those files
  *   3. Execute grep via just-bash for exact output formatting
- *   4. If --semantic flag, use vector search instead
+ *   4. If the hybrid path is used, use vector search for ranking
  */
 import { Bash } from "just-bash";
 import { MdgFs } from "../fs/mdgfs.ts";
@@ -18,8 +18,6 @@ export interface GrepOptions {
   paths: string[];
   /** Raw grep flags (e.g., -i, -n, -r, -l, etc.) */
   flags: string[];
-  /** Use vector/semantic search instead of text grep */
-  semantic?: boolean;
   /** Use hybrid search (RRF fusion of FTS + vector) */
   hybrid?: boolean;
   /** Working directory */
@@ -39,11 +37,6 @@ export interface GrepResult {
  */
 export async function executeGrep(options: GrepOptions): Promise<GrepResult> {
   const { pattern, paths, flags, cwd, patternFromFlag = false } = options;
-
-  // Semantic search mode
-  if (options.semantic) {
-    return executeSemanticSearch(pattern, paths, cwd, flags);
-  }
 
   // Hybrid search mode (RRF fusion of FTS + vector)
   if (options.hybrid) {
@@ -310,30 +303,6 @@ export function formatSearchResults(
     stderr: "",
     exitCode: 0,
   };
-}
-
-/**
- * Semantic/vector search mode — output formatted like grep.
- */
-async function executeSemanticSearch(
-  query: string,
-  paths: string[],
-  cwd: string,
-  flags: string[]
-): Promise<GrepResult> {
-  try {
-    const results = await searchVector(query, {
-      limit: 20,
-      filePaths: paths.length > 0 ? paths : undefined,
-    });
-    return formatSearchResults(results, flags, { explicitPaths: paths.length > 0 });
-  } catch (e: any) {
-    return {
-      stdout: "",
-      stderr: `semantic search error: ${e.message}`,
-      exitCode: 2,
-    };
-  }
 }
 
 /**
