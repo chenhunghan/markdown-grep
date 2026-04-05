@@ -1,0 +1,294 @@
+/**
+ * Search module: FTS and vector search over indexed markdown chunks.
+ */
+import { getDb, ensureVecTable } from "../db/index.ts";
+import { embed, getEmbeddingDimensions } from "../embedder/index.ts";
+
+export interface SearchResult {
+  /** Relative file path */
+  filePath: string;
+  /** Chunk content */
+  content: string;
+  /** Line range in original file */
+  startLine: number;
+  endLine: number;
+  /** Search score (higher = better) */
+  score: number;
+  /** Which search method found this */
+  method: "fts" | "vector" | "hybrid";
+}
+
+/**
+ * Full-text search using FTS5.
+ * Translates grep-like patterns to FTS5 query syntax.
+ */
+export function searchFTS(
+  query: string,
+  options: {
+    limit?: number;
+    filePaths?: string[];
+  } = {}
+): SearchResult[] {
+  const db = getDb();
+  const limit = options.limit || 100;
+
+  // Escape FTS5 special characters and build query
+  const ftsQuery = buildFTSQuery(query);
+
+  let sql = `
+    SELECT
+      c.id,
+      c.content,
+      c.start_line,
+      c.end_line,
+      f.path,
+      rank
+    FROM chunks_fts
+    JOIN chunks c ON chunks_fts.rowid = c.id
+    JOIN files f ON c.file_id = f.id
+    WHERE chunks_fts MATCH ?
+  `;
+
+  const params: (string | number)[] = [ftsQuery];
+
+  if (options.filePaths && options.filePaths.length > 0) {
+    const placeholders = options.filePaths.map(() => "?").join(", ");
+    sql += ` AND f.path IN (${placeholders})`;
+    params.push(...options.filePaths);
+  }
+
+  sql += ` ORDER BY rank LIMIT ?`;
+  params.push(limit);
+
+  try {
+    const rows = db.prepare(sql).all(...params) as {
+      id: number;
+      content: string;
+      start_line: number;
+      end_line: number;
+      path: string;
+      rank: number;
+    }[];
+
+    return rows.map((row) => ({
+      filePath: row.path,
+      content: row.content,
+      startLine: row.start_line,
+      endLine: row.end_line,
+      score: -row.rank, // FTS5 rank is negative (lower = better)
+      method: "fts" as const,
+    }));
+  } catch {
+    // If FTS query is malformed, fall back to empty results
+    return [];
+  }
+}
+
+/**
+ * Vector similarity search using sqlite-vec.
+ */
+export async function searchVector(
+  query: string,
+  options: {
+    limit?: number;
+    filePaths?: string[];
+  } = {}
+): Promise<SearchResult[]> {
+  const db = getDb();
+  const limit = options.limit || 20;
+
+  // Ensure vec table exists
+  const dimensions = await getEmbeddingDimensions();
+  ensureVecTable(dimensions);
+
+  // Embed the query
+  const queryVector = await embed(query, "query");
+
+  // sqlite-vec requires k=? constraint in the WHERE clause of the virtual table
+  // Use a subquery to get KNN results first, then join for metadata
+  const fetchLimit = limit * (options.filePaths ? 5 : 1); // over-fetch if filtering
+
+  const sql = `
+    SELECT
+      knn.chunk_id,
+      knn.distance,
+      c.content,
+      c.start_line,
+      c.end_line,
+      f.path
+    FROM (
+      SELECT chunk_id, distance
+      FROM chunks_vec
+      WHERE embedding MATCH ? AND k = ?
+    ) knn
+    JOIN chunks c ON knn.chunk_id = c.id
+    JOIN files f ON c.file_id = f.id
+    ORDER BY knn.distance ASC
+  `;
+
+  const rows = db.prepare(sql).all(
+    new Float32Array(queryVector),
+    fetchLimit
+  ) as {
+    chunk_id: number;
+    distance: number;
+    content: string;
+    start_line: number;
+    end_line: number;
+    path: string;
+  }[];
+
+  let results = rows.map((row) => ({
+    filePath: row.path,
+    content: row.content,
+    startLine: row.start_line,
+    endLine: row.end_line,
+    score: 1 / (1 + row.distance), // Convert distance to similarity score
+    method: "vector" as const,
+  }));
+
+  // Apply file path filter
+  if (options.filePaths && options.filePaths.length > 0) {
+    const pathSet = new Set(options.filePaths);
+    results = results.filter((r) => pathSet.has(r.filePath));
+  }
+
+  return results.slice(0, limit);
+}
+
+/**
+ * Find files whose chunks match an FTS query.
+ * Used for grep acceleration: coarse filter to narrow which files to grep.
+ */
+export function findMatchingFiles(query: string): string[] {
+  const db = getDb();
+  const ftsQuery = buildFTSQuery(query);
+
+  try {
+    const rows = db
+      .prepare(
+        `SELECT DISTINCT f.path
+         FROM chunks_fts
+         JOIN chunks c ON chunks_fts.rowid = c.id
+         JOIN files f ON c.file_id = f.id
+         WHERE chunks_fts MATCH ?
+         LIMIT 500`
+      )
+      .all(ftsQuery) as { path: string }[];
+
+    return rows.map((r) => r.path);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Build FTS5 query from a grep-like pattern.
+ * - Simple words become AND queries
+ * - Quoted strings become phrase queries
+ * - Handles common patterns
+ */
+function buildFTSQuery(pattern: string): string {
+  // If it looks like an FTS5 query already, pass through
+  if (
+    pattern.includes('"') ||
+    pattern.includes("AND") ||
+    pattern.includes("OR") ||
+    pattern.includes("NOT") ||
+    pattern.includes("NEAR")
+  ) {
+    return pattern;
+  }
+
+  // Escape special FTS5 characters
+  const escaped = pattern
+    .replace(/[*^${}()|[\]\\]/g, "")
+    .trim();
+
+  if (!escaped) return '""';
+
+  // Split into words and join with AND
+  const words = escaped.split(/\s+/).filter((w) => w.length > 0);
+  if (words.length === 1) {
+    return `"${words[0]}"`;
+  }
+
+  // Use phrase matching for multi-word queries
+  return `"${words.join(" ")}"`;
+}
+
+/**
+ * Hybrid search: combines FTS5 and vector search using Reciprocal Rank Fusion (RRF).
+ *
+ * RRF formula: score(d) = sum(1 / (k + rank_i(d)))
+ * where k is a constant (default 60) and rank_i is the rank in result set i.
+ *
+ * This approach (from codemogger's architecture) avoids the need to normalize
+ * scores across different search methods.
+ */
+export async function searchHybrid(
+  query: string,
+  options: {
+    limit?: number;
+    filePaths?: string[];
+    /** RRF constant k — higher values reduce impact of high rankings */
+    rrfK?: number;
+    /** Weight for FTS results (default 1.0) */
+    ftsWeight?: number;
+    /** Weight for vector results (default 1.0) */
+    vecWeight?: number;
+  } = {}
+): Promise<SearchResult[]> {
+  const limit = options.limit || 20;
+  const k = options.rrfK || 60;
+  const ftsWeight = options.ftsWeight ?? 1.0;
+  const vecWeight = options.vecWeight ?? 1.0;
+
+  // Fetch more candidates than needed for fusion
+  const fetchLimit = limit * 3;
+
+  // Run FTS and vector search in parallel
+  const [ftsResults, vecResults] = await Promise.all([
+    Promise.resolve(searchFTS(query, { limit: fetchLimit, filePaths: options.filePaths })),
+    searchVector(query, { limit: fetchLimit, filePaths: options.filePaths }),
+  ]);
+
+  // Build RRF scores keyed by chunk identity (filePath:startLine)
+  const rrfScores = new Map<string, { score: number; result: SearchResult }>();
+
+  function chunkKey(r: SearchResult): string {
+    return `${r.filePath}:${r.startLine}`;
+  }
+
+  // Score FTS results
+  for (let i = 0; i < ftsResults.length; i++) {
+    const r = ftsResults[i]!;
+    const key = chunkKey(r);
+    const rrfScore = ftsWeight / (k + i + 1);
+    const existing = rrfScores.get(key);
+    if (existing) {
+      existing.score += rrfScore;
+    } else {
+      rrfScores.set(key, { score: rrfScore, result: { ...r, method: "hybrid" } });
+    }
+  }
+
+  // Score vector results
+  for (let i = 0; i < vecResults.length; i++) {
+    const r = vecResults[i]!;
+    const key = chunkKey(r);
+    const rrfScore = vecWeight / (k + i + 1);
+    const existing = rrfScores.get(key);
+    if (existing) {
+      existing.score += rrfScore;
+    } else {
+      rrfScores.set(key, { score: rrfScore, result: { ...r, method: "hybrid" } });
+    }
+  }
+
+  // Sort by RRF score descending, return top results
+  return Array.from(rrfScores.values())
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ score, result }) => ({ ...result, score }));
+}
