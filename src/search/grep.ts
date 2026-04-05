@@ -9,9 +9,7 @@
  */
 import { Bash } from "just-bash";
 import { MdgFs } from "../fs/mdgfs.ts";
-import { findMatchingFiles, searchVector, searchFTS, searchHybrid } from "../search/index.ts";
-import { getDb } from "../db/index.ts";
-import { resolve } from "node:path";
+import { findMatchingFiles, searchVector, searchHybrid } from "../search/index.ts";
 
 export interface GrepOptions {
   /** The search pattern */
@@ -51,18 +49,20 @@ export async function executeGrep(options: GrepOptions): Promise<GrepResult> {
   }
 
   // Build the grep command
-  const grepArgs = buildGrepArgs(pattern, paths, flags, cwd);
+  const grepArgs = buildGrepArgs(pattern, paths, flags);
 
   // Try FTS acceleration: use the index to find candidate files
   let narrowedArgs = grepArgs;
-  try {
-    const candidateFiles = findMatchingFiles(pattern);
-    if (candidateFiles.length > 0 && candidateFiles.length < 200) {
-      // Narrow grep to only candidate files (FTS coarse filter)
-      narrowedArgs = buildNarrowedGrepArgs(pattern, candidateFiles, flags, cwd);
+  if (paths.length === 0) {
+    try {
+      const candidateFiles = findMatchingFiles(pattern);
+      if (candidateFiles.length > 0 && candidateFiles.length < 200) {
+        // Narrow grep to only candidate files (FTS coarse filter)
+        narrowedArgs = buildNarrowedGrepArgs(pattern, candidateFiles, flags);
+      }
+    } catch {
+      // Index may not exist yet, fall through to full grep
     }
-  } catch {
-    // Index may not exist yet, fall through to full grep
   }
 
   // Execute via just-bash with our read-only VFS
@@ -72,7 +72,7 @@ export async function executeGrep(options: GrepOptions): Promise<GrepResult> {
   try {
     const result = await bash.exec(`grep ${narrowedArgs}`);
     return {
-      stdout: result.stdout,
+      stdout: normalizeDefaultOutput(result.stdout, paths.length === 0),
       stderr: result.stderr,
       exitCode: result.exitCode,
     };
@@ -85,14 +85,33 @@ export async function executeGrep(options: GrepOptions): Promise<GrepResult> {
   }
 }
 
+function normalizeDefaultOutput(stdout: string, prefixDotSlash: boolean): string {
+  if (!prefixDotSlash || !stdout) return stdout;
+
+  return stdout
+    .split("\n")
+    .map((line) => {
+      if (
+        line === "" ||
+        line.startsWith("./") ||
+        line.startsWith("/") ||
+        line === "--" ||
+        line.startsWith("Binary file")
+      ) {
+        return line;
+      }
+      return `./${line}`;
+    })
+    .join("\n");
+}
+
 /**
  * Build grep arguments string.
  */
 function buildGrepArgs(
   pattern: string,
   paths: string[],
-  flags: string[],
-  cwd: string
+  flags: string[]
 ): string {
   const parts: string[] = [];
 
@@ -108,14 +127,13 @@ function buildGrepArgs(
   // Add paths or default to current dir
   if (paths.length > 0) {
     for (const p of paths) {
-      // Paths are relative to VFS root
-      parts.push(`'/${p}'`);
+      parts.push(`'${p.replace(/'/g, "'\\''")}'`);
     }
   } else {
     if (!hasRecursive) {
       parts.push("-r");
     }
-    parts.push("/");
+    parts.push(".");
   }
 
   return parts.join(" ");
@@ -128,8 +146,7 @@ function buildGrepArgs(
 function buildNarrowedGrepArgs(
   pattern: string,
   candidateFiles: string[],
-  flags: string[],
-  cwd: string
+  flags: string[]
 ): string {
   const parts: string[] = [];
 
@@ -149,7 +166,7 @@ function buildNarrowedGrepArgs(
 
   // Add only the candidate files
   for (const f of candidateFiles) {
-    parts.push(`'/${f}'`);
+    parts.push(`'${f.replace(/'/g, "'\\''")}'`);
   }
 
   return parts.join(" ");
@@ -158,16 +175,22 @@ function buildNarrowedGrepArgs(
 /**
  * Format search results (vector, hybrid) as grep-like output.
  */
-function formatSearchResults(
+export function formatSearchResults(
   results: { filePath: string; content: string; startLine: number; score: number; method: string }[],
-  flags: string[]
+  flags: string[],
+  options: { explicitPaths?: boolean } = {}
 ): GrepResult {
   if (results.length === 0) {
     return { stdout: "", stderr: "", exitCode: 1 };
   }
 
+  const explicitPaths = options.explicitPaths ?? false;
   const showLineNumbers = flags.includes("-n") || flags.includes("--line-number");
-  const showFilenames = results.length > 1 || flags.includes("-H") || flags.includes("--with-filename");
+  const showFilenames =
+    flags.includes("-H") ||
+    flags.includes("--with-filename") ||
+    !explicitPaths ||
+    results.length > 1;
   const onlyFilenames = flags.includes("-l") || flags.includes("--files-with-matches");
 
   if (onlyFilenames) {
@@ -181,6 +204,7 @@ function formatSearchResults(
 
   const lines: string[] = [];
   for (const result of results) {
+    const displayPath = explicitPaths ? result.filePath : `./${result.filePath}`;
     const contentLines = result.content.split("\n");
     for (let i = 0; i < contentLines.length; i++) {
       const line = contentLines[i]!;
@@ -188,7 +212,7 @@ function formatSearchResults(
 
       let output = "";
       if (showFilenames) {
-        output += `${result.filePath}:`;
+        output += `${displayPath}:`;
       }
       if (showLineNumbers) {
         output += `${result.startLine + i}:`;
@@ -219,7 +243,7 @@ async function executeSemanticSearch(
       limit: 20,
       filePaths: paths.length > 0 ? paths : undefined,
     });
-    return formatSearchResults(results, flags);
+    return formatSearchResults(results, flags, { explicitPaths: paths.length > 0 });
   } catch (e: any) {
     return {
       stdout: "",
@@ -243,7 +267,7 @@ async function executeHybridSearch(
       limit: 20,
       filePaths: paths.length > 0 ? paths : undefined,
     });
-    return formatSearchResults(results, flags);
+    return formatSearchResults(results, flags, { explicitPaths: paths.length > 0 });
   } catch (e: any) {
     return {
       stdout: "",
