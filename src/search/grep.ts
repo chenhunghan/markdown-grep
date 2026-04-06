@@ -9,7 +9,8 @@
  */
 import { Bash } from "just-bash";
 import { MdgFs } from "../fs/mdgfs.ts";
-import { findMatchingFiles, searchVector, searchHybrid } from "../search/index.ts";
+import { findMatchingFiles, searchVector, searchHybrid, selectBestLines } from "../search/index.ts";
+import type { LineSearchResult } from "../search/index.ts";
 
 export interface GrepOptions {
   /** The search pattern */
@@ -40,9 +41,35 @@ export async function executeGrep(options: GrepOptions): Promise<GrepResult> {
 
   // Hybrid search mode (RRF fusion of FTS + vector)
   if (options.hybrid) {
+    if (requiresExactFormatting(flags)) {
+      return executeNativeGrep(pattern, paths, flags, cwd, patternFromFlag);
+    }
     return executeHybridSearch(pattern, paths, cwd, flags);
   }
 
+  return executeNativeGrep(pattern, paths, flags, cwd, patternFromFlag);
+}
+
+function requiresExactFormatting(flags: string[]): boolean {
+  return (
+    flags.includes("-c") ||
+    flags.includes("--count") ||
+    flags.includes("-A") ||
+    flags.includes("--after-context") ||
+    flags.includes("-B") ||
+    flags.includes("--before-context") ||
+    flags.includes("-C") ||
+    flags.includes("--context")
+  );
+}
+
+async function executeNativeGrep(
+  pattern: string,
+  paths: string[],
+  flags: string[],
+  cwd: string,
+  patternFromFlag: boolean
+): Promise<GrepResult> {
   // Build the grep command
   const grepArgs = buildGrepArgs(pattern, paths, flags, patternFromFlag);
 
@@ -252,7 +279,7 @@ function buildNarrowedGrepArgs(
  * Format search results (vector, hybrid) as grep-like output.
  */
 export function formatSearchResults(
-  results: { filePath: string; content: string; startLine: number; score: number; method: string }[],
+  results: LineSearchResult[],
   flags: string[],
   options: { explicitPaths?: boolean } = {}
 ): GrepResult {
@@ -268,6 +295,10 @@ export function formatSearchResults(
     !explicitPaths ||
     results.length > 1;
   const onlyFilenames = flags.includes("-l") || flags.includes("--files-with-matches");
+  const countMode = flags.includes("-c") || flags.includes("--count");
+  const contextBefore = getContextCount(flags, "-B", "--before-context");
+  const contextAfter = getContextCount(flags, "-A", "--after-context");
+  const contextAny = contextBefore > 0 || contextAfter > 0 || flags.includes("-C") || flags.includes("--context");
 
   if (onlyFilenames) {
     const uniqueFiles = [...new Set(results.map((r) => r.filePath))];
@@ -278,31 +309,81 @@ export function formatSearchResults(
     };
   }
 
+  if (countMode) {
+    const counts = new Map<string, number>();
+    for (const result of results) {
+      counts.set(result.filePath, (counts.get(result.filePath) || 0) + 1);
+    }
+    const lines = Array.from(counts.entries()).map(([filePath, count]) => {
+      const displayPath = explicitPaths ? filePath : `./${filePath}`;
+      return showFilenames ? `${displayPath}:${count}` : `${count}`;
+    });
+    return { stdout: lines.join("\n") + "\n", stderr: "", exitCode: 0 };
+  }
+
   const lines: string[] = [];
   for (const result of results) {
     const displayPath = explicitPaths ? result.filePath : `./${result.filePath}`;
-    const contentLines = result.content.split("\n");
-    for (let i = 0; i < contentLines.length; i++) {
-      const line = contentLines[i]!;
-      if (line.trim() === "") continue;
+    const baseLine = result.lineText.trim();
+    if (!baseLine) continue;
 
+    if (!contextAny) {
       let output = "";
-      if (showFilenames) {
-        output += `${displayPath}:`;
-      }
-      if (showLineNumbers) {
-        output += `${result.startLine + i}:`;
-      }
-      output += line;
+      if (showFilenames) output += `${displayPath}:`;
+      if (showLineNumbers) output += `${result.lineNumber}:`;
+      output += baseLine;
       lines.push(output);
+      continue;
+    }
+
+    if (contextBefore > 0 || contextAfter > 0 || flags.includes("-C") || flags.includes("--context")) {
+      const beforeLines = result.context?.before || [];
+      const afterLines = result.context?.after || [];
+      for (const ctx of beforeLines.slice(-contextBefore || undefined)) {
+        lines.push(formatContextLine(displayPath, showFilenames, showLineNumbers, ctx.lineNumber, ctx.lineText, "-"));
+      }
+      lines.push(formatContextLine(displayPath, showFilenames, showLineNumbers, result.lineNumber, baseLine, ":"));
+      for (const ctx of afterLines.slice(0, contextAfter || undefined)) {
+        lines.push(formatContextLine(displayPath, showFilenames, showLineNumbers, ctx.lineNumber, ctx.lineText, "-"));
+      }
+      lines.push("--");
     }
   }
+
+  while (lines.length > 0 && lines[lines.length - 1] === "--") lines.pop();
 
   return {
     stdout: lines.join("\n") + "\n",
     stderr: "",
     exitCode: 0,
   };
+}
+
+function getContextCount(flags: string[], shortFlag: string, longFlag: string): number {
+  const shortIdx = flags.findIndex((f) => f === shortFlag);
+  if (shortIdx >= 0 && flags[shortIdx + 1] && /^\d+$/.test(flags[shortIdx + 1]!)) {
+    return Number(flags[shortIdx + 1]);
+  }
+  const longIdx = flags.findIndex((f) => f === longFlag);
+  if (longIdx >= 0 && flags[longIdx + 1] && /^\d+$/.test(flags[longIdx + 1]!)) {
+    return Number(flags[longIdx + 1]);
+  }
+  return 0;
+}
+
+function formatContextLine(
+  displayPath: string,
+  showFilenames: boolean,
+  showLineNumbers: boolean,
+  lineNumber: number,
+  lineText: string,
+  separator: string
+): string {
+  let output = "";
+  if (showFilenames) output += `${displayPath}`;
+  if (showLineNumbers) output += `${output ? ":" : ""}${lineNumber}`;
+  if (output) output += separator;
+  return `${output}${lineText}`;
 }
 
 /**
@@ -319,7 +400,8 @@ async function executeHybridSearch(
       limit: 20,
       filePaths: paths.length > 0 ? paths : undefined,
     });
-    return formatSearchResults(results, flags, { explicitPaths: paths.length > 0 });
+    const lineResults = await selectBestLines(query, results);
+    return formatSearchResults(lineResults, flags, { explicitPaths: paths.length > 0 });
   } catch (e: any) {
     return {
       stdout: "",

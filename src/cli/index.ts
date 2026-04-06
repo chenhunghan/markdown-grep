@@ -152,6 +152,7 @@ async function runStatus() {
 // ─── mdg grep ───────────────────────────────────────────────────────
 async function runGrep(rawArgs: string[]) {
   const cwd = process.cwd();
+  process.env.MDG_EMBED_RUNTIME = process.env.MDG_EMBED_RUNTIME || "ipc";
 
   // Hybrid search is the default; keep legacy flags as no-ops.
   const hybrid = true;
@@ -221,6 +222,8 @@ async function runEmbeddingWorker(args: string[]) {
     process.exit(2);
   }
 
+  process.env.MDG_EMBED_RUNTIME = process.env.MDG_EMBED_RUNTIME || "ipc";
+
   try {
     const modelId = getConfiguredModelUri();
     while (true) {
@@ -287,6 +290,18 @@ function parseGrepArgs(args: string[]): {
 
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
+
+    const attachedContext = arg.match(/^(-[ABC])(\d+)$/);
+    if (attachedContext) {
+      flags.push(attachedContext[1]!, attachedContext[2]!);
+      continue;
+    }
+
+    const attachedMax = arg.match(/^(-m)(\d+)$/);
+    if (attachedMax) {
+      flags.push(attachedMax[1]!, attachedMax[2]!);
+      continue;
+    }
 
     if (seenDoubleDash) {
       if (!patternFound) {

@@ -57,6 +57,11 @@ mdg grep -rc "pattern" docs/
 mdg grep -rn -A 2 -B 1 "function" .
 ```
 
+Notes:
+- `mdg grep` uses line-level output for normal search, but hybrid retrieval still ranks by markdown chunks internally.
+- Flags that change output structure, like `-c` and `-A/-B/-C`, are handled via native `grep` for exact compatibility.
+- For strict Unix `grep` parity, prefer explicit text-search flags and avoid relying on semantic ranking behavior.
+
 ### Hybrid search (vector similarity)
 
 ```bash

@@ -56,6 +56,12 @@ let _useIPC = false;
 // ─── Common state ───────────────────────────────────────────────────
 let _initPromise: Promise<void> | null = null;
 
+function getEmbedRuntimeMode(): "auto" | "ipc" | "in-process" {
+  const mode = process.env.MDG_EMBED_RUNTIME;
+  if (mode === "ipc" || mode === "in-process") return mode;
+  return "auto";
+}
+
 /**
  * Send a JSON-RPC request to the embed server subprocess.
  */
@@ -224,6 +230,21 @@ async function ensureInit(): Promise<void> {
   if (_initPromise) return _initPromise;
 
   _initPromise = (async () => {
+    const runtimeMode = getEmbedRuntimeMode();
+
+    if (runtimeMode === "ipc") {
+      _useIPC = true;
+      await initIPC();
+      return;
+    }
+
+    if (runtimeMode === "in-process") {
+      const llamaCpp = await import("node-llama-cpp");
+      _useIPC = false;
+      await initInProcess(llamaCpp);
+      return;
+    }
+
     // Strategy 1: try direct import (dev mode)
     try {
       const llamaCpp = await import("node-llama-cpp");

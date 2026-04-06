@@ -2,7 +2,7 @@
  * Search module: FTS and vector search over indexed markdown chunks.
  */
 import { getDb, ensureVecTable } from "../db/index.ts";
-import { embed, getEmbeddingDimensions } from "../embedder/index.ts";
+import { embed, embedBatch, getEmbeddingDimensions } from "../embedder/index.ts";
 
 export interface SearchResult {
   /** Relative file path */
@@ -16,6 +16,23 @@ export interface SearchResult {
   score: number;
   /** Which search method found this */
   method: "fts" | "vector" | "hybrid";
+}
+
+export interface LineContextLine {
+  lineNumber: number;
+  lineText: string;
+}
+
+export interface LineSearchResult {
+  filePath: string;
+  lineNumber: number;
+  lineText: string;
+  score: number;
+  method: "fts" | "vector" | "hybrid";
+  context?: {
+    before: LineContextLine[];
+    after: LineContextLine[];
+  };
 }
 
 /**
@@ -332,4 +349,125 @@ export async function searchHybrid(
     .sort((a, b) => b.score - a.score)
     .slice(0, limit)
     .map(({ score, result }) => ({ ...result, score }));
+}
+
+/**
+ * Reduce chunk-level search results to the most semantically similar line
+ * within each chunk.
+ */
+export async function selectBestLines(
+  query: string,
+  results: SearchResult[]
+): Promise<LineSearchResult[]> {
+  if (results.length === 0) return [];
+
+  const queryVector = await embed(query, "query");
+  const queryNorm = vectorNorm(queryVector);
+
+  const lineCandidates: {
+    resultIndex: number;
+    lineIndex: number;
+    line: string;
+  }[] = [];
+
+  for (let resultIndex = 0; resultIndex < results.length; resultIndex++) {
+    const result = results[resultIndex]!;
+    const lines = result.content.split("\n");
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      const line = lines[lineIndex]!.trim();
+      if (!line) continue;
+      lineCandidates.push({ resultIndex, lineIndex, line });
+    }
+  }
+
+  if (lineCandidates.length === 0) {
+    return results.map((result) => ({
+      filePath: result.filePath,
+      lineNumber: result.startLine,
+      lineText: result.content,
+      score: result.score,
+      method: result.method,
+      context: { before: [], after: [] },
+    }));
+  }
+
+  const lineVectors = await embedBatch(
+    lineCandidates.map((candidate) => candidate.line),
+    "document"
+  );
+
+  const bestByResult = new Map<number, { lineIndex: number; score: number }>();
+
+  for (let i = 0; i < lineCandidates.length; i++) {
+    const candidate = lineCandidates[i]!;
+    const lineVector = lineVectors[i]!;
+    const similarity = cosineSimilarity(queryVector, queryNorm, lineVector);
+    const existing = bestByResult.get(candidate.resultIndex);
+
+    if (!existing || similarity > existing.score) {
+      bestByResult.set(candidate.resultIndex, {
+        lineIndex: candidate.lineIndex,
+        score: similarity,
+      });
+    }
+  }
+
+  const lineResults = results.map((result, index): LineSearchResult | SearchResult => {
+    const best = bestByResult.get(index);
+    if (!best) return result;
+
+    const lines = result.content.split("\n");
+    const selectedLine = lines[best.lineIndex];
+    if (!selectedLine) return result;
+
+    const before = lines.slice(0, best.lineIndex).map((line, offset) => ({
+      lineNumber: result.startLine + offset,
+      lineText: line,
+    }));
+    const after = lines.slice(best.lineIndex + 1).map((line, offset) => ({
+      lineNumber: result.startLine + best.lineIndex + offset + 1,
+      lineText: line,
+    }));
+
+    return {
+      filePath: result.filePath,
+      lineNumber: result.startLine + best.lineIndex,
+      lineText: selectedLine,
+      score: result.score,
+      method: result.method,
+      context: {
+        before,
+        after,
+      },
+    };
+  });
+
+  const deduped = new Map<string, LineSearchResult>();
+  for (const result of lineResults) {
+    if (!("lineNumber" in result)) continue;
+    const key = `${result.filePath}:${result.lineNumber}`;
+    const existing = deduped.get(key);
+    if (!existing || existing.score < result.score) {
+      deduped.set(key, result);
+    }
+  }
+
+  return Array.from(deduped.values()).sort((a, b) => b.score - a.score);
+}
+
+function vectorNorm(vector: number[]): number {
+  let sum = 0;
+  for (const value of vector) sum += value * value;
+  return Math.sqrt(sum) || 1;
+}
+
+function cosineSimilarity(queryVector: number[], queryNorm: number, lineVector: number[]): number {
+  let dot = 0;
+  let lineSum = 0;
+  for (let i = 0; i < queryVector.length && i < lineVector.length; i++) {
+    dot += queryVector[i]! * lineVector[i]!;
+    lineSum += lineVector[i]! * lineVector[i]!;
+  }
+  const lineNorm = Math.sqrt(lineSum) || 1;
+  return dot / (queryNorm * lineNorm);
 }
