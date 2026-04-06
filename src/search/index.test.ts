@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import { searchHybrid } from "./index.ts";
 
-test("hybrid search initializes readiness before running search branches", async () => {
+test("hybrid search falls back to FTS when embeddings are cold", async () => {
   const calls: string[] = [];
 
-  await searchHybrid("query", {
+  const results = await searchHybrid("query", {
     limit: 1,
     deps: {
       ensureVectorSearchReady: async () => {
@@ -22,5 +22,6 @@ test("hybrid search initializes readiness before running search branches", async
     },
   });
 
-  expect(calls).toEqual(["ready", "fts", "vector"]);
+  expect(calls).toEqual(["fts"]);
+  expect(results).toEqual([]);
 });

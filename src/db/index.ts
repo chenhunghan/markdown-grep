@@ -18,6 +18,49 @@ const DB_PATH = join(MDG_DIR, "mdg.db");
 
 let _db: Database | null = null;
 
+const EMBEDDING_JOB_TYPE = "embedding_refresh";
+const JOB_LEASE_MS = 2 * 60 * 1000;
+const JOB_STALE_MS = 30 * 1000;
+
+export interface BackgroundJob {
+  job_key: string;
+  job_type: string;
+  root_path: string;
+  model_id: string;
+  status: string;
+  requested_generation: number;
+  completed_generation: number;
+  claimed_generation: number;
+  lease_owner: string | null;
+  lease_until: number;
+  attempts: number;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  finished_at: number | null;
+  last_error: string | null;
+}
+
+export interface EnqueueEmbeddingJobArgs {
+  rootPath: string;
+  modelId: string;
+}
+
+export interface ClaimEmbeddingJobArgs {
+  leaseOwner: string;
+  now?: number;
+  rootPath?: string;
+  modelId?: string;
+}
+
+export interface ClaimedBackgroundJob {
+  job_key: string;
+  root_path: string;
+  model_id: string;
+  requested_generation: number;
+  claimed_generation: number;
+}
+
 /**
  * On macOS, the system SQLite is compiled without extension loading.
  * Swap in Homebrew's SQLite if available.
@@ -89,6 +132,153 @@ export function getDbPath(): string {
 
 export function getMdgDir(): string {
   return MDG_DIR;
+}
+
+export function enqueueEmbeddingRefresh(args: EnqueueEmbeddingJobArgs): void {
+  const db = getDb();
+  const now = Date.now();
+  const jobKey = `${EMBEDDING_JOB_TYPE}:${args.rootPath}:${args.modelId}`;
+
+  db.prepare(
+    `INSERT INTO background_jobs (
+      job_key, job_type, root_path, model_id,
+      status, requested_generation, completed_generation, claimed_generation,
+      lease_owner, lease_until, attempts, created_at, updated_at, started_at, finished_at, last_error
+    ) VALUES (?, ?, ?, ?, 'pending', 1, 0, 0, NULL, 0, 0, ?, ?, NULL, NULL, NULL)
+    ON CONFLICT(job_key) DO UPDATE SET
+      requested_generation = background_jobs.requested_generation + 1,
+      status = CASE
+        WHEN background_jobs.completed_generation < background_jobs.requested_generation + 1 THEN 'pending'
+        ELSE background_jobs.status
+      END,
+      updated_at = excluded.updated_at,
+      last_error = NULL
+    `
+  ).run(
+    jobKey,
+    EMBEDDING_JOB_TYPE,
+    args.rootPath,
+    args.modelId,
+    now,
+    now
+  );
+}
+
+export function claimNextEmbeddingJob(args: ClaimEmbeddingJobArgs): ClaimedBackgroundJob | null {
+  const db = getDb();
+  const now = args.now ?? Date.now();
+  const leaseUntil = now + JOB_LEASE_MS;
+  const filters: string[] = [];
+  const params: (string | number)[] = [EMBEDDING_JOB_TYPE, now];
+
+  if (args.rootPath) {
+    filters.push("root_path = ?");
+    params.push(args.rootPath);
+  }
+  if (args.modelId) {
+    filters.push("model_id = ?");
+    params.push(args.modelId);
+  }
+
+  const filterSql = filters.length > 0 ? ` AND ${filters.join(" AND ")}` : "";
+
+  const tx = db.transaction(() => {
+    const stale = db
+      .prepare(
+        `UPDATE background_jobs
+         SET status = 'pending', lease_owner = NULL, lease_until = 0, updated_at = ?
+         WHERE job_type = ?
+           AND status = 'running'
+           AND lease_until < ?
+           AND completed_generation < requested_generation`
+      )
+      .run(now, EMBEDDING_JOB_TYPE, now - JOB_STALE_MS);
+
+    void stale;
+
+    const job = db
+      .prepare(
+        `SELECT * FROM background_jobs
+         WHERE job_type = ?
+           AND status IN ('pending', 'running')
+           AND completed_generation < requested_generation
+           AND (lease_until = 0 OR lease_until < ?)
+           ${filterSql}
+         ORDER BY updated_at ASC
+         LIMIT 1`
+      )
+      .get(...params) as BackgroundJob | null;
+
+    if (!job) return null;
+
+    const updated = db
+      .prepare(
+        `UPDATE background_jobs
+         SET status = 'running',
+             lease_owner = ?,
+             lease_until = ?,
+             claimed_generation = requested_generation,
+             attempts = attempts + 1,
+             started_at = COALESCE(started_at, ?),
+             updated_at = ?
+         WHERE job_key = ?
+           AND (lease_until = 0 OR lease_until < ?)
+           AND completed_generation < requested_generation`
+      )
+      .run(args.leaseOwner, leaseUntil, now, now, job.job_key, now);
+
+    if (updated.changes === 0) return null;
+
+      return {
+        job_key: job.job_key,
+        root_path: job.root_path,
+        model_id: job.model_id,
+        requested_generation: job.requested_generation,
+        claimed_generation: job.claimed_generation || job.requested_generation,
+      };
+  });
+
+  return tx();
+}
+
+export function completeEmbeddingJob(jobKey: string, generation: number): void {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(
+    `UPDATE background_jobs
+     SET status = CASE WHEN requested_generation > ? THEN 'pending' ELSE 'done' END,
+         completed_generation = MAX(completed_generation, ?),
+         lease_owner = NULL,
+         lease_until = 0,
+         finished_at = ?,
+         updated_at = ?,
+         last_error = NULL
+     WHERE job_key = ?`
+  ).run(generation, generation, now, now, jobKey);
+}
+
+export function failEmbeddingJob(jobKey: string, error: string): void {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(
+    `UPDATE background_jobs
+     SET status = 'pending',
+         lease_owner = NULL,
+         lease_until = 0,
+         updated_at = ?,
+         last_error = ?,
+         finished_at = NULL
+     WHERE job_key = ?`
+  ).run(now, error, jobKey);
+}
+
+export function getEmbeddingJobState(rootPath: string, modelId: string): BackgroundJob | null {
+  const db = getDb();
+  return (
+    db.prepare(
+      `SELECT * FROM background_jobs WHERE job_key = ? LIMIT 1`
+    ).get(`${EMBEDDING_JOB_TYPE}:${rootPath}:${modelId}`) as BackgroundJob | null
+  );
 }
 
 export function getDb(): Database {

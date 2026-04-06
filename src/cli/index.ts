@@ -8,11 +8,12 @@
  *   mdg index [--force]                          # build/update index
  *   mdg status                                   # show index status
  */
-import { indexDirectory, needsReindex, getIndexStatus } from "../indexer/index.ts";
+import { indexDirectory, needsReindex, getIndexStatus, refreshEmbeddingsForRoot } from "../indexer/index.ts";
 import { executeGrep } from "../search/grep.ts";
-import { getDb, closeDb } from "../db/index.ts";
-import { disposeEmbedder } from "../embedder/index.ts";
+import { getDb, closeDb, enqueueEmbeddingRefresh, claimNextEmbeddingJob, completeEmbeddingJob, failEmbeddingJob } from "../db/index.ts";
+import { disposeEmbedder, getConfiguredModelUri } from "../embedder/index.ts";
 import { isSidecarInstalled, installSidecar } from "../embedder/sidecar.ts";
+import { spawn } from "node:child_process";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -30,6 +31,9 @@ async function main() {
       break;
     case "setup":
       await runSetup();
+      break;
+    case "embedding-worker":
+      await runEmbeddingWorker(args.slice(1));
       break;
     case "--help":
     case "-h":
@@ -162,8 +166,8 @@ async function runGrep(rawArgs: string[]) {
     process.exit(2);
   }
 
-  // Trigger background index if needed (non-blocking)
-  triggerBackgroundIndex(cwd);
+  // Trigger background maintenance if needed (non-blocking)
+  void triggerBackgroundIndex(cwd).finally(() => triggerEmbeddingRefresh(cwd));
 
   try {
     const result = await executeGrep({
@@ -188,6 +192,56 @@ async function runGrep(rawArgs: string[]) {
     process.exit(2);
   } finally {
     closeDb();
+  }
+}
+
+function triggerEmbeddingRefresh(rootPath: string): void {
+  try {
+    const modelId = getConfiguredModelUri();
+    enqueueEmbeddingRefresh({ rootPath, modelId });
+
+    const entry = process.argv[1] || "";
+    const workerArgs = entry.endsWith(".ts") || entry.endsWith(".js")
+      ? [entry, "embedding-worker", rootPath]
+      : ["embedding-worker", rootPath];
+
+    const child = spawn(process.execPath, workerArgs, {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+  } catch {
+    // Background embedding is best-effort only.
+  }
+}
+
+async function runEmbeddingWorker(args: string[]) {
+  const rootPath = args[0];
+  if (!rootPath) {
+    process.exit(2);
+  }
+
+  try {
+    const modelId = getConfiguredModelUri();
+    while (true) {
+      const claimed = claimNextEmbeddingJob({ leaseOwner: `${process.pid}`, rootPath, modelId });
+      if (!claimed) break;
+
+      try {
+        const result = await refreshEmbeddingsForRoot(rootPath);
+        if (result.needsRetry) {
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          continue;
+        }
+        completeEmbeddingJob(claimed.job_key, claimed.requested_generation);
+      } catch (error: any) {
+        failEmbeddingJob(claimed.job_key, error?.message || String(error));
+        break;
+      }
+    }
+  } finally {
+    closeDb();
+    await disposeEmbedder();
   }
 }
 
@@ -281,7 +335,7 @@ function parseGrepArgs(args: string[]): {
  * Trigger a background index update (non-blocking).
  * Ensures first `mdg grep` works even without a prior `mdg index`.
  */
-function triggerBackgroundIndex(cwd: string): void {
+function triggerBackgroundIndex(cwd: string): Promise<void> {
   try {
     const db = getDb();
     const fileCount = db
@@ -290,19 +344,21 @@ function triggerBackgroundIndex(cwd: string): void {
 
     if (fileCount.count === 0) {
       // No index — do a quick FTS-only index (fire and forget)
-      indexDirectory(cwd, { skipEmbeddings: true }).catch(() => {});
+      return indexDirectory(cwd, { skipEmbeddings: true }).then(() => undefined).catch(() => undefined);
     } else {
       // Index exists — check for updates in background
-      needsReindex(cwd)
+      return needsReindex(cwd)
         .then((needs) => {
           if (needs) {
-            indexDirectory(cwd, { skipEmbeddings: true }).catch(() => {});
+            return indexDirectory(cwd, { skipEmbeddings: true }).then(() => undefined).catch(() => undefined);
           }
+          return undefined;
         })
-        .catch(() => {});
+        .catch(() => undefined);
     }
   } catch {
     // DB not ready, skip acceleration
+    return Promise.resolve();
   }
 }
 

@@ -26,6 +26,16 @@ export async function ensureVectorSearchReady(): Promise<number> {
   return getEmbeddingDimensions();
 }
 
+function hasWarmEmbeddings(): boolean {
+  const db = getDb();
+  const unembedded = db
+    .prepare("SELECT COUNT(*) as count FROM chunks WHERE embedding IS NULL")
+    .get() as { count: number };
+  if (unembedded.count > 0) return false;
+
+  return true;
+}
+
 /**
  * Full-text search using FTS5.
  * Translates grep-like patterns to FTS5 query syntax.
@@ -266,6 +276,11 @@ export async function searchHybrid(
 
   // Fetch more candidates than needed for fusion
   const fetchLimit = limit * 3;
+
+  if (!hasWarmEmbeddings()) {
+    const ftsOnly = searchFtsFn(query, { limit, filePaths: options.filePaths });
+    return ftsOnly.map((result) => ({ ...result, method: "hybrid" as const }));
+  }
 
   // Initialize vector search before any SQLite access in the parallel branches.
   await ensureVectorSearchReadyFn();

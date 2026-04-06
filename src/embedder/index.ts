@@ -28,6 +28,10 @@ function getModelUri(): string {
   return process.env.MDG_EMBED_MODEL || DEFAULT_EMBED_MODEL;
 }
 
+export function getConfiguredModelUri(): string {
+  return getModelUri();
+}
+
 function isQwen3Model(uri: string): boolean {
   return /qwen.*embed/i.test(uri) || /embed.*qwen/i.test(uri);
 }

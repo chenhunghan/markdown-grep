@@ -11,6 +11,7 @@ import {
   getEmbeddingDimensions,
   getModelId,
 } from "../embedder/index.ts";
+import { getDbPath } from "../db/index.ts";
 
 export interface IndexStats {
   totalFiles: number;
@@ -216,7 +217,7 @@ export async function indexDirectory(
 
   // 5. Generate embeddings (if not skipped)
   if (!options.skipEmbeddings) {
-    await generateEmbeddings(log, stats, options.force);
+    await refreshEmbeddings(log, stats, { force: options.force });
   }
 
   stats.durationMs = Date.now() - start;
@@ -226,10 +227,14 @@ export async function indexDirectory(
 /**
  * Generate embeddings for chunks that don't have them yet.
  */
-async function generateEmbeddings(
+export async function refreshEmbeddings(
   log: (msg: string) => void,
   stats: IndexStats,
-  force?: boolean
+  options: {
+    force?: boolean;
+    rootPath?: string;
+    modelId?: string;
+  } = {}
 ): Promise<void> {
   const db = getDb();
 
@@ -238,14 +243,14 @@ async function generateEmbeddings(
   const dimensions = await getEmbeddingDimensions();
   ensureVecTable(dimensions);
 
-  const modelId = await getModelId();
+  const modelId = options.modelId || (await getModelId());
   log(`Embedding model ready (${dimensions} dimensions)`);
 
   // Find chunks without embeddings (or with wrong model)
-  const whereClause = force
+  const whereClause = options.force
     ? ""
     : "WHERE embedding IS NULL OR embed_model != ?";
-  const params = force ? [] : [modelId];
+  const params = options.force ? [] : [modelId];
 
   const chunks = db
     .prepare(
@@ -302,6 +307,80 @@ async function generateEmbeddings(
     const progress = Math.min(i + batchSize, chunks.length);
     log(`Embedded ${progress}/${chunks.length} chunks`);
   }
+}
+
+export interface EmbeddingRefreshResult {
+  filesSeen: number;
+  scannedChunks: number;
+  embeddedChunks: number;
+  needsRetry: boolean;
+}
+
+export async function refreshEmbeddingsForRoot(rootPath: string): Promise<EmbeddingRefreshResult> {
+  const db = getDb();
+  const modelId = await getModelId();
+  const dimensions = await getEmbeddingDimensions();
+  ensureVecTable(dimensions);
+
+  const rootPrefix = rootPath.endsWith("/") ? rootPath : `${rootPath}/`;
+
+  const filesSeen = db
+    .prepare("SELECT COUNT(*) as count FROM files WHERE abs_path LIKE ?")
+    .get(`${rootPrefix}%`) as { count: number };
+  if (filesSeen.count === 0) {
+    return { filesSeen: 0, scannedChunks: 0, embeddedChunks: 0, needsRetry: false };
+  }
+
+  const chunks = db
+    .prepare(
+      `SELECT c.id, c.content, f.path
+       FROM chunks c JOIN files f ON c.file_id = f.id
+       WHERE f.abs_path LIKE ?
+         AND (c.embedding IS NULL OR c.embed_model != ?)
+       ORDER BY c.id`
+    )
+    .all(`${rootPrefix}%`, modelId) as { id: number; content: string; path: string }[];
+
+  if (chunks.length === 0) {
+    return { filesSeen: filesSeen.count, scannedChunks: 0, embeddedChunks: 0, needsRetry: true };
+  }
+
+  const batchSize = 32;
+  const updateChunk = db.prepare(
+    "UPDATE chunks SET embedding = ?, embed_model = ? WHERE id = ?"
+  );
+  const insertVec = db.prepare(
+    "INSERT OR REPLACE INTO chunks_vec (chunk_id, embedding) VALUES (?, vec_f32(?))"
+  );
+
+  for (let i = 0; i < chunks.length; i += batchSize) {
+    const batch = chunks.slice(i, i + batchSize);
+    const texts = batch.map((c) => c.content);
+    const titles = batch.map((c) => c.path);
+    const embeddings = await embedBatch(texts, "document", titles);
+
+    const tx = db.transaction(() => {
+      for (let j = 0; j < batch.length; j++) {
+        const chunk = batch[j]!;
+        const vector = embeddings[j]!;
+        const buffer = new Float32Array(vector);
+        updateChunk.run(Buffer.from(buffer.buffer), modelId, chunk.id);
+        insertVec.run(chunk.id, JSON.stringify(vector));
+      }
+    });
+    tx();
+  }
+
+  return {
+    filesSeen: filesSeen.count,
+    scannedChunks: chunks.length,
+    embeddedChunks: chunks.length,
+    needsRetry: false,
+  };
+}
+
+export function getEmbeddingDbPath(): string {
+  return getDbPath();
 }
 
 /**

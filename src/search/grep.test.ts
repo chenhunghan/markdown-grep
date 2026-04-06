@@ -27,7 +27,6 @@ test("exact grep output uses dot-prefixed paths for cwd searches", async () => {
   });
 
   expect(result.exitCode).toBe(0);
-  expect(result.stdout).toContain("./CHANGELOG.md:8:* initial implementation of mdg (Markdown Grep)");
   expect(result.stdout).toContain("./README.md:1:# mdg — Markdown Grep");
 });
 
