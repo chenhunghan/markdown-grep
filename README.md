@@ -14,7 +14,7 @@ bun install
 To install the latest release binary into `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chenhunghan/mdg/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/chenhunghan/markdown-grep/main/install.sh | bash
 ```
 
 Re-running the script is safe; it updates `mdg` to the latest GitHub release if needed.
@@ -22,7 +22,7 @@ Re-running the script is safe; it updates `mdg` to the latest GitHub release if 
 On Windows, use PowerShell:
 
 ```powershell
-iwr https://raw.githubusercontent.com/chenhunghan/mdg/main/install.ps1 | iex
+iwr https://raw.githubusercontent.com/chenhunghan/markdown-grep/main/install.ps1 | iex
 ```
 
 Re-running the PowerShell script is also safe; it updates `mdg.exe` to the latest GitHub release if needed.

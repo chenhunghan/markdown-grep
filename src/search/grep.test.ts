@@ -24,7 +24,7 @@ test("exact grep output matches plain grep paths for explicit files", async () =
   expect(result.exitCode).toBe(0);
   expect(result.stdout).toBe(
     "README.md:1:# mdg — Markdown Grep\n" +
-      "CHANGELOG.md:8:* initial implementation of mdg (Markdown Grep) ([1b04d97](https://github.com/chenhunghan/mdg/commit/1b04d970ebdaeda53c27bd0cfdf3c0e856657069))\n"
+      "CHANGELOG.md:8:* initial implementation of mdg (Markdown Grep) ([1b04d97](https://github.com/chenhunghan/markdown-grep/commit/1b04d970ebdaeda53c27bd0cfdf3c0e856657069))\n"
   );
 });
 

@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-REPO="chenhunghan/mdg"
+REPO="chenhunghan/markdown-grep"
 BIN_NAME="mdg"
 INSTALL_DIR="${MDG_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION_FILE="${INSTALL_DIR}/.mdg-version"

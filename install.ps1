@@ -4,7 +4,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Repo = 'chenhunghan/mdg'
+$Repo = 'chenhunghan/markdown-grep'
 $BinName = 'mdg.exe'
 
 if (-not $InstallDir) {
