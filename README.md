@@ -79,21 +79,21 @@ bun run build
 
 ## Search setup
 
-The compiled binary handles grep and FTS search standalone.
-Hybrid search is auto-installed on first use.
+Zero setup for basic `mdg grep` use.
+Optional smart search auto-installs on first use.
 
 ```bash
-# Pre-install search dependencies
+# Pre-install optional smart search dependencies
 mdg setup
 
-# Or just use mdg grep and it auto-installs on first run
+# Or just use mdg grep and it auto-installs on first use
 mdg grep "how to configure the API"
 ```
 
 ## Notes
 
 - `mdg grep` is line-oriented for normal text search.
-- `mdg setup` pre-installs the optional hybrid search dependencies.
+- `mdg setup` pre-installs optional smart search dependencies.
 
 ## Requirements
 
